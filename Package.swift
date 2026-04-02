@@ -19,6 +19,10 @@ let package = Package(
         .target(
             name: "NearWaveKit"
         ),
+        .testTarget(
+            name: "NearWaveKitTests",
+            dependencies: ["NearWaveKit"]
+        ),
     ],
     swiftLanguageModes: [.v5]
 )

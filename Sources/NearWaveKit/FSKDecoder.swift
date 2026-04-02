@@ -57,6 +57,19 @@ public final class FSKDecoder {
         attemptDecode()
     }
 
+    /// Synchronous convenience for testing: feed a complete sample buffer and
+    /// return the first successfully decoded payload, or `nil`.
+    public func processSynchronously(samples: [Float]) -> [UInt8]? {
+        var result: [UInt8]?
+        let previousCallback = onFrameDecoded
+        onFrameDecoded = { data in
+            if result == nil { result = data }
+        }
+        process(samples: samples)
+        onFrameDecoded = previousCallback
+        return result
+    }
+
     /// Clear internal buffers (e.g. when stopping).
     public func reset() {
         sampleBuffer.removeAll()
