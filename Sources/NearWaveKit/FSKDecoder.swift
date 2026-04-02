@@ -6,8 +6,10 @@ import Foundation
 ///
 /// Pipeline:  [Float] samples → frequency detection → bits → bytes → Frame
 ///
-/// Uses the Goertzel algorithm to measure energy at freq0 and freq1 for each
-/// bit-window of samples, then reconstructs bytes and validates the checksum.
+/// Uses the Goertzel algorithm to measure energy at freq0 and freq1 inside
+/// the **tone portion** of each symbol window (tone + silence gap).
+/// The silence gap and the fade-in / fade-out edges are excluded from
+/// analysis to improve noise tolerance on real iOS hardware.
 public final class FSKDecoder {
 
     public var onFrameDecoded: ((_ data: [UInt8]) -> Void)?
@@ -20,9 +22,31 @@ public final class FSKDecoder {
     /// Expected preamble bit pattern (0xAA 0xAA → 1010101010101010).
     private let preambleBits: [Bool]
 
+    /// Samples per full symbol (tone + gap) — the decoder stride.
+    private let samplesPerSymbol: Int
+
+    /// Samples of the tone portion only (used for Goertzel window).
+    private let samplesPerTone: Int
+
+    /// How many samples to skip at the start of each tone (fade-in margin).
+    private let toneMargin: Int
+
+    /// The clean analysis window length inside a tone.
+    private let analysisLength: Int
+
     public init(config: NSDTConfig = .default) {
         self.config = config
         self.preambleBits = BitConverter.bytesToBits(Frame.preamble)
+        self.samplesPerSymbol = config.samplesPerSymbol
+        self.samplesPerTone = config.samplesPerBit
+
+        // Skip ~10% on each side of the tone to avoid fade-in/fade-out transients.
+        let margin = max(config.samplesPerBit / 10, 1)
+        self.toneMargin = margin
+        self.analysisLength = max(config.samplesPerBit - 2 * margin, margin)
+
+        config.logSummary()
+        NWLog.debug("[FSKDecoder] samplesPerSymbol=\(samplesPerSymbol), toneMargin=\(toneMargin), analysisLength=\(analysisLength)")
     }
 
     // MARK: - Public API
@@ -41,89 +65,100 @@ public final class FSKDecoder {
     // MARK: - Decode Pipeline
 
     private func attemptDecode() {
-        let samplesPerBit = config.samplesPerBit
+        let preambleBitCount = preambleBits.count
+        let preambleSymbols = preambleBitCount * samplesPerSymbol
 
-        // We need at least enough samples for the preamble to even start looking.
-        let preambleSamples = preambleBits.count * samplesPerBit
-        guard sampleBuffer.count >= preambleSamples else { return }
+        // Need at least a full preamble to start searching.
+        guard sampleBuffer.count >= preambleSymbols else { return }
 
         // Step 1 — slide through buffer looking for the preamble
-        if let preambleOffset = findPreamble() {
-            NWLog.debug("[FSKDecoder] preamble found at sample offset \(preambleOffset)")
+        guard let preambleOffset = findPreamble() else { return }
 
-            // Start of payload (after preamble)
-            let payloadStart = preambleOffset + preambleSamples
+        NWLog.debug("[FSKDecoder] preamble found at sample offset \(preambleOffset)")
 
-            // We need at least 1 byte (length) to continue → 8 bits
-            let lengthBitsCount = 8
-            let minSamplesForLength = payloadStart + lengthBitsCount * samplesPerBit
-            guard sampleBuffer.count >= minSamplesForLength else { return }
+        // Start of payload (after preamble symbols)
+        let payloadStart = preambleOffset + preambleSymbols
 
-            // Decode the length byte
-            let lengthBits = decodeBits(from: payloadStart, count: lengthBitsCount)
-            let lengthBytes = BitConverter.bitsToBytes(lengthBits)
-            let length = lengthBytes[0]
-            NWLog.debug("[FSKDecoder] length byte: \(length)")
+        // We need at least the length byte (8 symbols)
+        let lengthBitsCount = 8
+        let minForLength = payloadStart + lengthBitsCount * samplesPerSymbol
+        guard sampleBuffer.count >= minForLength else { return }
 
-            // Total bits after preamble: 8 (length) + length*8 (data) + 8 (checksum)
-            let totalPayloadBits = 8 + Int(length) * 8 + 8
-            let totalNeeded = payloadStart + totalPayloadBits * samplesPerBit
-            guard sampleBuffer.count >= totalNeeded else { return }
+        // Decode the length byte
+        let lengthBits = decodeBits(from: payloadStart, count: lengthBitsCount, label: "length")
+        let lengthBytes = BitConverter.bitsToBytes(lengthBits)
+        let length = lengthBytes[0]
+        NWLog.debug("[FSKDecoder] length byte: \(length)")
 
-            // Decode all payload bits at once
-            let allBits = decodeBits(from: payloadStart, count: totalPayloadBits)
-            let allBytes = BitConverter.bitsToBytes(allBits) // [Length][Data...][Checksum]
-
-            NWLog.debug("[FSKDecoder] decoded bytes: \(allBytes)")
-
-            // Attempt frame decode
-            if let frame = Frame.decode(from: allBytes) {
-                NWLog.debug("[FSKDecoder] ✅ valid frame: \(frame.data)")
-                onFrameDecoded?(frame.data)
-            } else {
-                NWLog.debug("[FSKDecoder] ❌ frame decode failed (checksum or format)")
-            }
-
-            // Consume processed samples regardless of success to avoid re-triggering on same data
-            let consumed = payloadStart + totalPayloadBits * samplesPerBit
-            if consumed <= sampleBuffer.count {
-                sampleBuffer.removeFirst(consumed)
-            } else {
-                sampleBuffer.removeAll()
-            }
-
-            // Try again in case there are more frames in the buffer
+        // Sanity — reject obviously bad lengths early.
+        guard length > 0 && length <= 32 else {
+            NWLog.debug("[FSKDecoder] ⚠️ implausible length \(length), skipping")
+            consumeSamples(preambleOffset + samplesPerSymbol)
             attemptDecode()
+            return
+        }
+
+        // Total symbols after preamble: 8 (length) + length*8 (data) + 8 (checksum)
+        let totalPayloadBits = 8 + Int(length) * 8 + 8
+        let totalNeeded = payloadStart + totalPayloadBits * samplesPerSymbol
+        guard sampleBuffer.count >= totalNeeded else { return }
+
+        // Decode all payload bits at once
+        let allBits = decodeBits(from: payloadStart, count: totalPayloadBits, label: "payload")
+        let allBytes = BitConverter.bitsToBytes(allBits) // [Length][Data...][Checksum]
+
+        NWLog.debug("[FSKDecoder] decoded bytes: \(allBytes)")
+
+        // Attempt frame decode
+        if let frame = Frame.decode(from: allBytes) {
+            NWLog.debug("[FSKDecoder] ✅ valid frame: \(frame.data)")
+            onFrameDecoded?(frame.data)
+        } else {
+            NWLog.debug("[FSKDecoder] ❌ frame decode failed (checksum or format)")
+        }
+
+        // Consume processed samples regardless of success
+        consumeSamples(payloadStart + totalPayloadBits * samplesPerSymbol)
+
+        // Try again for additional frames in the buffer
+        attemptDecode()
+    }
+
+    /// Safely remove processed samples from the front of the buffer.
+    private func consumeSamples(_ count: Int) {
+        if count <= sampleBuffer.count {
+            sampleBuffer.removeFirst(count)
+        } else {
+            sampleBuffer.removeAll()
         }
     }
 
     // MARK: - Preamble Detection
 
-    /// Slide one bit-window at a time looking for the preamble pattern.
+    /// Slide through the buffer looking for the preamble bit pattern.
     /// Returns the sample offset of the start of the preamble, or nil.
     private func findPreamble() -> Int? {
-        let samplesPerBit = config.samplesPerBit
         let preambleBitCount = preambleBits.count
-        let preambleSamples = preambleBitCount * samplesPerBit
+        let preambleSymbols = preambleBitCount * samplesPerSymbol
 
-        // Don't search past what we could actually decode
-        let searchLimit = sampleBuffer.count - preambleSamples
+        let searchLimit = sampleBuffer.count - preambleSymbols
         guard searchLimit >= 0 else { return nil }
 
-        // Step by half a bit window for sub-window alignment tolerance
-        let step = max(samplesPerBit / 2, 1)
+        // Step by ¼ symbol for good alignment tolerance without being too slow.
+        let step = max(samplesPerSymbol / 4, 1)
 
         for offset in stride(from: 0, through: searchLimit, by: step) {
-            let bits = decodeBits(from: offset, count: preambleBitCount)
+            let bits = decodeBitsRaw(from: offset, count: preambleBitCount)
             if bits == preambleBits {
                 return offset
             }
         }
 
-        // If we've searched a lot without finding preamble, trim old samples to avoid unbounded growth.
-        let trimThreshold = samplesPerBit * 200 // ~200 bits worth
+        // Trim old samples to prevent unbounded growth.
+        // Keep enough for one full preamble so we don't miss a partial one.
+        let trimThreshold = samplesPerSymbol * 400
         if sampleBuffer.count > trimThreshold {
-            let toRemove = sampleBuffer.count - preambleSamples
+            let toRemove = sampleBuffer.count - preambleSymbols
             sampleBuffer.removeFirst(toRemove)
             NWLog.debug("[FSKDecoder] trimmed \(toRemove) old samples")
         }
@@ -134,25 +169,55 @@ public final class FSKDecoder {
     // MARK: - Bit Decoding via Goertzel
 
     /// Decode `count` bits starting at the given sample offset.
-    private func decodeBits(from offset: Int, count: Int) -> [Bool] {
-        let samplesPerBit = config.samplesPerBit
+    /// Each bit occupies `samplesPerSymbol` samples (tone + gap).
+    /// Only the center of the tone is analyzed (skipping fade margins).
+    /// Logs per-bit energies when `label` is provided.
+    private func decodeBits(from offset: Int, count: Int, label: String) -> [Bool] {
         var bits: [Bool] = []
         bits.reserveCapacity(count)
 
         for i in 0 ..< count {
-            let start = offset + i * samplesPerBit
-            let end = start + samplesPerBit
-            guard end <= sampleBuffer.count else {
+            let symbolStart = offset + i * samplesPerSymbol
+            // Skip the fade-in margin; analyze the clean center of the tone.
+            let analysisStart = symbolStart + toneMargin
+            let analysisEnd = analysisStart + analysisLength
+            guard analysisEnd <= sampleBuffer.count else {
                 bits.append(false)
                 continue
             }
 
-            let window = Array(sampleBuffer[start ..< end])
-            let energy0 = goertzelMagnitude(samples: window, targetFreq: config.freq0, sampleRate: config.sampleRate)
-            let energy1 = goertzelMagnitude(samples: window, targetFreq: config.freq1, sampleRate: config.sampleRate)
+            let window = Array(sampleBuffer[analysisStart ..< analysisEnd])
+            let e0 = goertzelMagnitude(samples: window, targetFreq: config.effectiveFreq0, sampleRate: config.sampleRate)
+            let e1 = goertzelMagnitude(samples: window, targetFreq: config.effectiveFreq1, sampleRate: config.sampleRate)
 
-            let bit = energy1 > energy0
+            let bit = e1 > e0
             bits.append(bit)
+
+            NWLog.debug("[FSKDecoder] \(label)[\(i)] e0=\(String(format: "%.1f", e0)) e1=\(String(format: "%.1f", e1)) → \(bit ? "1" : "0")")
+        }
+
+        return bits
+    }
+
+    /// Fast bit decode without per-bit logging (used during preamble scanning).
+    private func decodeBitsRaw(from offset: Int, count: Int) -> [Bool] {
+        var bits: [Bool] = []
+        bits.reserveCapacity(count)
+
+        for i in 0 ..< count {
+            let symbolStart = offset + i * samplesPerSymbol
+            let analysisStart = symbolStart + toneMargin
+            let analysisEnd = analysisStart + analysisLength
+            guard analysisEnd <= sampleBuffer.count else {
+                bits.append(false)
+                continue
+            }
+
+            let window = Array(sampleBuffer[analysisStart ..< analysisEnd])
+            let e0 = goertzelMagnitude(samples: window, targetFreq: config.effectiveFreq0, sampleRate: config.sampleRate)
+            let e1 = goertzelMagnitude(samples: window, targetFreq: config.effectiveFreq1, sampleRate: config.sampleRate)
+
+            bits.append(e1 > e0)
         }
 
         return bits
