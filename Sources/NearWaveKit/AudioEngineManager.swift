@@ -158,3 +158,76 @@ public final class AudioEngineManager {
             isInputRunning = true
             NWLog.debug("[AudioEngine] input started (sampleRate=\(desiredSampleRate))")
         } catch {
+            NWLog.debug("[AudioEngine] failed to start engine: \(error)")
+            inputNode.removeTap(onBus: 0)
+        }
+    }
+
+    /// Stop microphone capture.
+    public func stopInput() {
+        guard isInputRunning else { return }
+
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        isInputRunning = false
+        NWLog.debug("[AudioEngine] input stopped")
+    }
+
+    // MARK: - Output (Speaker)
+
+    /// Play an array of Float32 mono samples through the speaker.
+    /// Blocks the caller until playback is scheduled (not until it finishes).
+    public func play(samples: [Float], completion: (() -> Void)? = nil) {
+        configureAudioSession()
+        let sampleRate = config.sampleRate
+
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: 1,
+            interleaved: false
+        ) else {
+            NWLog.debug("[AudioEngine] failed to create playback format")
+            return
+        }
+
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)) else {
+            NWLog.debug("[AudioEngine] failed to create PCM buffer")
+            return
+        }
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+
+        // Copy samples into the buffer
+        if let channelData = buffer.floatChannelData {
+            samples.withUnsafeBufferPointer { src in
+                channelData[0].initialize(from: src.baseAddress!, count: samples.count)
+            }
+        }
+
+        // Attach player if needed
+        if !playerAttached {
+            engine.attach(playerNode)
+            engine.connect(playerNode, to: engine.mainMixerNode, format: format)
+            playerAttached = true
+        }
+
+        if !engine.isRunning {
+            engine.prepare()
+            do {
+                try engine.start()
+            } catch {
+                NWLog.debug("[AudioEngine] failed to start engine for playback: \(error)")
+                return
+            }
+        }
+
+        NWLog.debug("[AudioEngine] scheduling playback: \(samples.count) samples")
+
+        playerNode.stop()
+        playerNode.scheduleBuffer(buffer, at: nil, options: []) {
+            NWLog.debug("[AudioEngine] playback finished")
+            completion?()
+        }
+        playerNode.play()
+    }
+}
