@@ -22,6 +22,13 @@ public final class AudioEngineManager {
     /// Whether the player node has been attached to the engine.
     private var playerAttached = false
 
+    /// Enable to print verbose mic-level debug logs (🎤 lines).
+    /// Set to `false` once you've confirmed input works.
+    public var isDebugLoggingEnabled = true
+
+    /// Counter used to throttle debug prints (every Nth buffer).
+    private var tapCallbackCount: Int = 0
+
     public init(config: NSDTConfig = .default) {
         self.config = config
     }
@@ -32,29 +39,41 @@ public final class AudioEngineManager {
     /// Must be called before accessing `inputNode.inputFormat(forBus:)`,
     /// otherwise iOS returns a zero-rate / zero-channel format and the tap crashes.
     private func configureAudioSession() {
-        #if os(iOS) || os(tvOS) || os(watchOS)
         let session = AVAudioSession.sharedInstance()
         do {
-            // .measurement disables iOS AGC, noise suppression, and automatic
-            // gain adjustments — critical for reliable FSK tone detection.
             try session.setCategory(
                 .playAndRecord,
-                mode: .measurement,
-                options: [.defaultToSpeaker, .mixWithOthers, .allowBluetoothA2DP]
+                mode: .default,
+                options: [.defaultToSpeaker, .mixWithOthers, .allowBluetooth]
             )
             try session.setPreferredSampleRate(config.sampleRate)
-            // Request a small IO buffer for lower latency (not critical, but helps).
-            try session.setPreferredIOBufferDuration(0.005)
             try session.setActive(true)
-            NWLog.debug("[AudioEngine] audio session activated — mode: measurement")
-            NWLog.debug("[AudioEngine]   hw sampleRate = \(session.sampleRate)")
-            NWLog.debug("[AudioEngine]   hw ioBufferDuration = \(session.ioBufferDuration)")
+
+            if isDebugLoggingEnabled {
+                print("🎤 Audio session activated")
+                print("🎤   category      = \(session.category.rawValue)")
+                print("🎤   sampleRate    = \(session.sampleRate)")
+                print("🎤   inputChannels = \(session.inputNumberOfChannels)")
+                print("🎤   outputChannels= \(session.outputNumberOfChannels)")
+            }
+            NWLog.debug("[AudioEngine] audio session activated (hw sampleRate=\(session.sampleRate))")
         } catch {
+            print("🎤 ❌ Audio session configuration FAILED: \(error)")
             NWLog.debug("[AudioEngine] failed to configure audio session: \(error)")
         }
-        #else
-        NWLog.debug("[AudioEngine] audio session configuration skipped (macOS)")
-        #endif
+    }
+
+    /// Request microphone permission and log the result.
+    /// Call before `startInput` to ensure the user has granted access.
+    private func requestMicPermission(completion: @escaping (Bool) -> Void) {
+        AVAudioSession.sharedInstance().requestRecordPermission { granted in
+            if granted {
+                print("🎤 ✅ Microphone permission GRANTED")
+            } else {
+                print("🎤 ❌ Microphone permission DENIED")
+            }
+            completion(granted)
+        }
     }
 
     /// Start capturing microphone audio.
@@ -65,18 +84,43 @@ public final class AudioEngineManager {
             return
         }
 
-        // Activate the audio session BEFORE touching inputNode so the
-        // hardware format reports valid sample-rate and channel count.
+        // Step 1 — Ensure microphone permission
+        requestMicPermission { [weak self] granted in
+            guard granted else {
+                print("🎤 ❌ Cannot start input — mic permission denied")
+                return
+            }
+            DispatchQueue.main.async {
+                self?.startInputAfterPermission(callback: callback)
+            }
+        }
+    }
+
+    private func startInputAfterPermission(callback: @escaping ([Float]) -> Void) {
+        guard !isInputRunning else { return }
+
+        // Step 2 — Activate the audio session BEFORE touching inputNode
         configureAudioSession()
 
         let inputNode = engine.inputNode
-        let hardwareFormat = inputNode.inputFormat(forBus: 0)
+
+        // Use outputFormat — this is what the input node *delivers* to the engine,
+        // and is always valid after the session is active.
+        // (inputFormat can return 0 Hz / 0 ch on iOS.)
+        let hardwareFormat = inputNode.outputFormat(forBus: 0)
         let desiredSampleRate = config.sampleRate
 
+        if isDebugLoggingEnabled {
+            print("🎤 inputNode.outputFormat = \(hardwareFormat)")
+            print("🎤   sampleRate   = \(hardwareFormat.sampleRate)")
+            print("🎤   channelCount = \(hardwareFormat.channelCount)")
+            print("🎤   desired SR   = \(desiredSampleRate)")
+        }
         NWLog.debug("[AudioEngine] hardware input format: \(hardwareFormat)")
 
         // Guard against a still-invalid hardware format (e.g. 0 Hz).
         guard hardwareFormat.sampleRate > 0, hardwareFormat.channelCount > 0 else {
+            print("🎤 ❌ Hardware format is INVALID (0 Hz or 0 ch) — cannot install tap")
             NWLog.debug("[AudioEngine] hardware format is invalid — cannot install tap")
             return
         }
@@ -88,13 +132,13 @@ public final class AudioEngineManager {
             channels: 1,
             interleaved: false
         ) else {
+            print("🎤 ❌ Failed to create desired AVAudioFormat")
             NWLog.debug("[AudioEngine] failed to create desired audio format")
             return
         }
 
-        // On iOS the tap format MUST match the hardware input format,
+        // On iOS the tap format MUST match the hardware output format,
         // otherwise installTap crashes with a format-mismatch error.
-        // We tap using the hardware format and convert ourselves.
         let needsConversion = (hardwareFormat.sampleRate != desiredSampleRate
                                || hardwareFormat.channelCount != 1)
 
@@ -102,25 +146,45 @@ public final class AudioEngineManager {
         if needsConversion {
             converter = AVAudioConverter(from: hardwareFormat, to: desiredFormat)
             if converter == nil {
+                print("🎤 ⚠️ Failed to create AVAudioConverter")
                 NWLog.debug("[AudioEngine] failed to create audio converter")
+            } else if isDebugLoggingEnabled {
+                print("🎤 Converter created: \(hardwareFormat.sampleRate)Hz \(hardwareFormat.channelCount)ch → \(desiredSampleRate)Hz 1ch")
             }
         } else {
             converter = nil
+            if isDebugLoggingEnabled {
+                print("🎤 No conversion needed — formats already match")
+            }
         }
 
-        // Tap with the hardware format so there is no mismatch.
-        let bufferSize: AVAudioFrameCount = 1024
+        // Step 3 — Install tap with the hardware format so there is no mismatch.
+        let bufferSize: AVAudioFrameCount = 2048
         let tapFormat = needsConversion ? hardwareFormat : desiredFormat
 
-        inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: tapFormat) { buffer, _ in
+        if isDebugLoggingEnabled {
+            print("🎤 Installing tap: bus=0, bufferSize=\(bufferSize), format=\(tapFormat)")
+        }
+
+        tapCallbackCount = 0
+
+        inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: tapFormat) { [weak self] buffer, _ in
+            guard let self else { return }
+            self.tapCallbackCount += 1
+
+            // --- Extract samples (with optional conversion) ---
+            let samples: [Float]
+
             if let converter = converter {
-                // Convert hardware buffer → desired mono / sample-rate buffer.
                 let ratio = desiredSampleRate / hardwareFormat.sampleRate
                 let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1
                 guard let convertedBuffer = AVAudioPCMBuffer(
                     pcmFormat: desiredFormat,
                     frameCapacity: capacity
-                ) else { return }
+                ) else {
+                    if self.isDebugLoggingEnabled { print("🎤 ❌ Failed to allocate conversion buffer") }
+                    return
+                }
 
                 var error: NSError?
                 var consumed = false
@@ -135,29 +199,64 @@ public final class AudioEngineManager {
                 }
 
                 if let error = error {
+                    if self.isDebugLoggingEnabled { print("🎤 ❌ Conversion error: \(error)") }
                     NWLog.debug("[AudioEngine] conversion error: \(error)")
                     return
                 }
 
-                guard let channelData = convertedBuffer.floatChannelData else { return }
+                guard let channelData = convertedBuffer.floatChannelData else {
+                    if self.isDebugLoggingEnabled { print("🎤 ❌ convertedBuffer.floatChannelData is nil") }
+                    return
+                }
                 let frameCount = Int(convertedBuffer.frameLength)
-                let samples = Array(UnsafeBufferPointer(start: channelData[0], count: frameCount))
-                callback(samples)
+                if frameCount == 0 {
+                    if self.isDebugLoggingEnabled { print("🎤 ⚠️ Converted buffer has 0 frames") }
+                    return
+                }
+                samples = Array(UnsafeBufferPointer(start: channelData[0], count: frameCount))
             } else {
-                // No conversion needed — formats already match.
-                guard let channelData = buffer.floatChannelData else { return }
+                // No conversion needed
+                guard let channelData = buffer.floatChannelData else {
+                    if self.isDebugLoggingEnabled { print("🎤 ❌ buffer.floatChannelData is nil") }
+                    return
+                }
                 let frameCount = Int(buffer.frameLength)
-                let samples = Array(UnsafeBufferPointer(start: channelData[0], count: frameCount))
-                callback(samples)
+                if frameCount == 0 {
+                    if self.isDebugLoggingEnabled { print("🎤 ⚠️ Buffer has 0 frames") }
+                    return
+                }
+                samples = Array(UnsafeBufferPointer(start: channelData[0], count: frameCount))
             }
+
+            // --- Debug logging (every 50th buffer to avoid spam) ---
+            if self.isDebugLoggingEnabled && self.tapCallbackCount % 50 == 1 {
+                var maxAmp: Float = 0
+                var energy: Float = 0
+                for s in samples {
+                    let abs = abs(s)
+                    if abs > maxAmp { maxAmp = abs }
+                    energy += abs
+                }
+                print("🎤 Tap #\(self.tapCallbackCount): \(samples.count) samples | maxAmp=\(String(format: "%.6f", maxAmp)) | energy=\(String(format: "%.2f", energy))")
+            }
+
+            // Step 4 — Deliver to decoder
+            callback(samples)
         }
 
+        // Step 5 — Start engine
         do {
             engine.prepare()
             try engine.start()
             isInputRunning = true
-            NWLog.debug("[AudioEngine] input started (sampleRate=\(desiredSampleRate))")
+
+            let running = engine.isRunning
+            if isDebugLoggingEnabled {
+                print("🎤 ✅ Audio engine started — isRunning=\(running)")
+            }
+            NWLog.debug("[AudioEngine] input started (sampleRate=\(desiredSampleRate), isRunning=\(running))")
         } catch {
+            print("🎤 ❌ Engine start FAILED: \(error)")
             NWLog.debug("[AudioEngine] failed to start engine: \(error)")
             inputNode.removeTap(onBus: 0)
         }
@@ -209,6 +308,13 @@ public final class AudioEngineManager {
             engine.attach(playerNode)
             engine.connect(playerNode, to: engine.mainMixerNode, format: format)
             playerAttached = true
+        }
+
+        // Stop input tap temporarily if running, because we need to reconfigure.
+        let wasInputRunning = isInputRunning
+        if wasInputRunning {
+            // We can play while input is running if the engine is already started.
+            // Only restart if the engine is not running.
         }
 
         if !engine.isRunning {
