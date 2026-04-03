@@ -5,4 +5,13 @@ xcuserdata/
 DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.swiftpm/xcode/xcshareddata/
 .netrc
+Package.resolved
+*.xcodeproj
+*.profdata
+*.profraw
+
+# Ignore generated WAV files, but keep test resource assets
+*.wav
+!Tests/NearWaveKitTests/Resources/*.wav
