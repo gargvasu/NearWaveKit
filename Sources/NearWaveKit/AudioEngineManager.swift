@@ -33,20 +33,22 @@ public final class AudioEngineManager {
         self.config = config
     }
 
-    // MARK: - Input (Microphone)
+    // MARK: - Audio Session (iOS only)
 
     /// Configure the shared audio session for recording + playback.
     /// Must be called before accessing `inputNode.inputFormat(forBus:)`,
     /// otherwise iOS returns a zero-rate / zero-channel format and the tap crashes.
     private func configureAudioSession() {
+        #if os(iOS) || os(tvOS) || os(watchOS)
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(
                 .playAndRecord,
-                mode: .default,
-                options: [.defaultToSpeaker, .mixWithOthers, .allowBluetooth]
+                mode: .measurement,
+                options: [.defaultToSpeaker, .mixWithOthers, .allowBluetoothA2DP]
             )
             try session.setPreferredSampleRate(config.sampleRate)
+            try session.setPreferredIOBufferDuration(0.005)
             try session.setActive(true)
 
             if isDebugLoggingEnabled {
@@ -61,11 +63,15 @@ public final class AudioEngineManager {
             print("🎤 ❌ Audio session configuration FAILED: \(error)")
             NWLog.debug("[AudioEngine] failed to configure audio session: \(error)")
         }
+        #else
+        NWLog.debug("[AudioEngine] audio session configuration skipped (macOS)")
+        #endif
     }
 
     /// Request microphone permission and log the result.
     /// Call before `startInput` to ensure the user has granted access.
     private func requestMicPermission(completion: @escaping (Bool) -> Void) {
+        #if os(iOS) || os(tvOS)
         AVAudioSession.sharedInstance().requestRecordPermission { granted in
             if granted {
                 print("🎤 ✅ Microphone permission GRANTED")
@@ -74,7 +80,14 @@ public final class AudioEngineManager {
             }
             completion(granted)
         }
+        #else
+        // macOS does not use AVAudioSession — permission is handled differently.
+        NWLog.debug("[AudioEngine] mic permission check skipped (macOS)")
+        completion(true)
+        #endif
     }
+
+    // MARK: - Input (Microphone)
 
     /// Start capturing microphone audio.
     /// `callback` is invoked on an internal audio thread with chunks of Float32 samples.
@@ -233,9 +246,9 @@ public final class AudioEngineManager {
                 var maxAmp: Float = 0
                 var energy: Float = 0
                 for s in samples {
-                    let abs = abs(s)
-                    if abs > maxAmp { maxAmp = abs }
-                    energy += abs
+                    let a = abs(s)
+                    if a > maxAmp { maxAmp = a }
+                    energy += a
                 }
                 print("🎤 Tap #\(self.tapCallbackCount): \(samples.count) samples | maxAmp=\(String(format: "%.6f", maxAmp)) | energy=\(String(format: "%.2f", energy))")
             }
@@ -308,13 +321,6 @@ public final class AudioEngineManager {
             engine.attach(playerNode)
             engine.connect(playerNode, to: engine.mainMixerNode, format: format)
             playerAttached = true
-        }
-
-        // Stop input tap temporarily if running, because we need to reconfigure.
-        let wasInputRunning = isInputRunning
-        if wasInputRunning {
-            // We can play while input is running if the engine is already started.
-            // Only restart if the engine is not running.
         }
 
         if !engine.isRunning {
